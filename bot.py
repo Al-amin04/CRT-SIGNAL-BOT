@@ -22,8 +22,8 @@ import requests
 CONFIG = {
     # pair name -> Yahoo tickers, tried in order
     "pairs": {
-        "XAUUSD": ["XAUUSD=X", "GC=F"],
-        "XAGUSD": ["XAGUSD=X", "SI=F"],
+        "XAUUSD": ["GC=F"],
+        "XAGUSD": ["SI=F"],
         "EURUSD": ["EURUSD=X"],
         "GBPUSD": ["GBPUSD=X"],
         "USDJPY": ["USDJPY=X"],
