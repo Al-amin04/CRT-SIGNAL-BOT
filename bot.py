@@ -44,8 +44,14 @@ CONFIG = {
     "max_between": 5,       # max candles between candle 1 and the sweep candle
     "lookback_sweeps": 2,   # how many recent CRT candles may be the sweep candle
     "swing_n": 2,           # bars each side for a swing high/low
-    "alert_on_sweep": True,  # also alert on a sweep before the MSS shows
+    "alert_on_sweep": True,   # also alert on a sweep before the MSS shows
     "tz": "America/New_York",  # daily candle closes 17:00 in this zone
+    "display_tz": "Africa/Lagos",  # time zone shown in alerts
+    # "oanda" = OANDA prices (matches TradingView OANDA charts). Needs OANDA_TOKEN.
+    # Without a token the bot falls back to Yahoo.
+    "source": "oanda",
+    "oanda_host": "api-fxpractice.oanda.com",  # live account: api-fxtrade.oanda.com
+    "oanda_price": "B",  # B = bid (TradingView default), M = mid, A = ask
     "history": "60d",
 }
 
@@ -89,6 +95,52 @@ def fetch_1h(tickers):
         df = df[~df.index.duplicated(keep="last")].sort_index()
         return df
     return None
+
+
+def fetch_oanda_1h(pair):
+    """OANDA 1H candles. Same index format as fetch_1h."""
+    tok = os.environ.get("OANDA_TOKEN")
+    if not tok:
+        return None
+    price = CONFIG["oanda_price"]
+    key = {"M": "mid", "B": "bid", "A": "ask"}[price]
+    inst = f"{pair[:3]}_{pair[3:]}"
+    try:
+        r = requests.get(
+            f"https://{CONFIG['oanda_host']}/v3/instruments/{inst}/candles",
+            headers={"Authorization": f"Bearer {tok}"},
+            params={"granularity": "H1", "count": 1000, "price": price},
+            timeout=30,
+        )
+        r.raise_for_status()
+        candles = r.json()["candles"]
+    except Exception as e:
+        print(f"  OANDA error {pair}: {e}")
+        return None
+    rows = [
+        (c["time"], float(c[key]["o"]), float(c[key]["h"]),
+         float(c[key]["l"]), float(c[key]["c"]))
+        for c in candles
+        if key in c
+    ]
+    if not rows:
+        return None
+    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close"])
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df.set_index("time")
+    df.index = df.index.tz_convert(CONFIG["tz"]).tz_localize(None)
+    return df[~df.index.duplicated(keep="last")].sort_index()
+
+
+def fetch_pair(pair, tickers):
+    """Returns (dataframe, source name)."""
+    if CONFIG["source"] == "oanda":
+        df = fetch_oanda_1h(pair)
+        if df is not None:
+            return df, "OANDA"
+        print(f"  {pair}: OANDA failed or no token, using Yahoo")
+    df = fetch_1h(tickers)
+    return df, "Yahoo (levels may differ from TradingView)"
 
 
 def resample(df, tf):
@@ -243,10 +295,21 @@ def fmt(pair, x):
     return f"{x:.{d}f}"
 
 
-def build_message(pair, tf, ltf_tf, setup, mss, price, bias):
+def local_time(ts):
+    """Show a bot candle time in your own time zone."""
+    try:
+        t = pd.Timestamp(ts).tz_localize(CONFIG["tz"], ambiguous=True,
+                                         nonexistent="shift_forward")
+        return t.tz_convert(CONFIG["display_tz"]).strftime("%a %d %b %H:%M")
+    except Exception:
+        return str(ts)
+
+
+def build_message(pair, tf, ltf_tf, setup, mss, price, bias, source=""):
     buy = setup["direction"] == "buy"
     head = f"{'🟢 BUY' if buy else '🔴 SELL'} {pair} | {TF_NAME[tf]} CRT ({setup['model']})"
     lines = [head, f"CRT H: {fmt(pair, setup['H'])}   CRT L: {fmt(pair, setup['L'])}"]
+    lines.append(f"CRT candle opened: {local_time(setup['c1_time'])}")
     if mss:
         stop, target = mss["extreme"], (setup["H"] if buy else setup["L"])
         word = "above" if buy else "below"
@@ -262,6 +325,8 @@ def build_message(pair, tf, ltf_tf, setup, mss, price, bias):
         lines.append(f"Sweep seen. Waiting for the MSS on {ltf_tf}.")
     if usd_role(pair):
         lines.append(f"DXY weekly bias: {bias}")
+    if source:
+        lines.append(f"Data: {source}")
     return "\n".join(lines)
 
 
@@ -310,7 +375,7 @@ def run():
         print(f"DXY weekly bias: {bias}")
 
     for pair, tickers in CONFIG["pairs"].items():
-        df = fetch_1h(tickers)
+        df, source = fetch_pair(pair, tickers)
         if df is None:
             print(f"{pair}: no data")
             continue
@@ -332,17 +397,14 @@ def run():
                     ltf, setup["direction"], setup["H"], setup["L"], setup["sweep_time"]
                 )
                 if mss:
-                    if key in state["sent"]:
-                        break
-                    msg = build_message(pair, tf, ltf_tf, setup, mss, price, bias)
-                    if send(msg):
-                        state["sent"][key] = now.isoformat()
-                    break
-                if CONFIG["alert_on_sweep"] and key + "|sweep" not in state["sent"]:
-                    msg = build_message(pair, tf, ltf_tf, setup, None, price, bias)
+                    if key not in state["sent"]:
+                        msg = build_message(pair, tf, ltf_tf, setup, mss, price, bias, source)
+                        if send(msg):
+                            state["sent"][key] = now.isoformat()
+                elif CONFIG["alert_on_sweep"] and key + "|sweep" not in state["sent"]:
+                    msg = build_message(pair, tf, ltf_tf, setup, None, price, bias, source)
                     if send(msg):
                         state["sent"][key + "|sweep"] = now.isoformat()
-                    break
             print(f"{pair} {tf}: checked")
     save_state(state, now)
 
