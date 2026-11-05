@@ -44,6 +44,10 @@ CONFIG = {
     # CRT models the bot may alert on. All four:
     # ["2 candle", "3 candle", "Inside bar", "Multiple candle"]
     "models": ["3 candle"],
+    # Skip entry alerts whose RR is below this. RR is measured if you enter on a
+    # retest of the broken MSS level, with stop at the sweep and target at the
+    # opposite CRT level. Set 0 to turn the filter off.
+    "min_rr": 2.0,
     "max_between": 5,       # max candles between candle 1 and the sweep candle
     "lookback_sweeps": 2,   # how many recent CRT candles may be the sweep candle
     "swing_n": 2,           # bars each side for a swing high/low
@@ -300,6 +304,18 @@ def fmt(pair, x):
     return f"{x:.{d}f}"
 
 
+def calc_rr(direction, entry, stop, target):
+    sg = 1 if direction == "buy" else -1
+    risk = (entry - stop) * sg
+    reward = (target - entry) * sg
+    return reward / risk if risk > 0 and reward > 0 else 0.0
+
+
+def setup_prices(setup, mss):
+    buy = setup["direction"] == "buy"
+    return mss["extreme"], (setup["H"] if buy else setup["L"])
+
+
 def local_time(ts):
     """Show a bot candle time in your own time zone."""
     try:
@@ -316,15 +332,16 @@ def build_message(pair, tf, ltf_tf, setup, mss, price, bias, source=""):
     lines = [head, f"CRT H: {fmt(pair, setup['H'])}   CRT L: {fmt(pair, setup['L'])}"]
     lines.append(f"CRT candle opened: {local_time(setup['c1_time'])}")
     if mss:
-        stop, target = mss["extreme"], (setup["H"] if buy else setup["L"])
+        stop, target = setup_prices(setup, mss)
         word = "above" if buy else "below"
         lines.append(f"Sweep {'low' if buy else 'high'}: {fmt(pair, stop)}")
         lines.append(f"MSS on {ltf_tf}: closed {word} {fmt(pair, mss['level'])}")
         lines.append(f"Stop: beyond {fmt(pair, stop)}")
         lines.append(f"Target: {fmt(pair, target)} (CRT {'H' if buy else 'L'})")
-        risk, reward = abs(price - stop), abs(target - price)
-        if risk > 0:
-            lines.append(f"Price now: {fmt(pair, price)}   RR about {reward / risk:.1f}")
+        rr_lvl = calc_rr(setup["direction"], mss["level"], stop, target)
+        rr_now = calc_rr(setup["direction"], price, stop, target)
+        lines.append(f"Price now: {fmt(pair, price)}")
+        lines.append(f"RR from MSS level: {rr_lvl:.1f}   RR at price now: {rr_now:.1f}")
         lines.append("Next: find your POI on the chart.")
     else:
         lines.append(f"Sweep seen. Waiting for the MSS on {ltf_tf}.")
@@ -402,7 +419,11 @@ def run():
                     ltf, setup["direction"], setup["H"], setup["L"], setup["sweep_time"]
                 )
                 if mss:
-                    if key not in state["sent"]:
+                    stop, target = setup_prices(setup, mss)
+                    rr = calc_rr(setup["direction"], mss["level"], stop, target)
+                    if rr < CONFIG["min_rr"]:
+                        print(f"  {pair} {tf}: skipped, RR {rr:.1f} below {CONFIG['min_rr']}")
+                    elif key not in state["sent"]:
                         msg = build_message(pair, tf, ltf_tf, setup, mss, price, bias, source)
                         if send(msg):
                             state["sent"][key] = now.isoformat()
