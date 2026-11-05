@@ -43,7 +43,7 @@ CONFIG = {
     "sweep_confirm": "inside",
     # CRT models the bot may alert on. All four:
     # ["2 candle", "3 candle", "Inside bar", "Multiple candle"]
-    "models": ["3 candle", "Inside bar", "Multiple candle"],
+    "models": ["3 candle", "Inside bar"],
     # Skip entry alerts whose RR is below this. RR is measured if you enter on a
     # retest of the broken MSS level, with stop at the sweep and target at the
     # opposite CRT level. Set 0 to turn the filter off.
