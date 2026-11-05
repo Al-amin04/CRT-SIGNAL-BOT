@@ -41,6 +41,9 @@ CONFIG = {
     # "inside" = sweep candle must close back inside the CRT range
     # "wick"   = a wick beyond the level is enough
     "sweep_confirm": "inside",
+    # CRT models the bot may alert on. All four:
+    # ["2 candle", "3 candle", "Inside bar", "Multiple candle"]
+    "models": ["3 candle"],
     "max_between": 5,       # max candles between candle 1 and the sweep candle
     "lookback_sweeps": 2,   # how many recent CRT candles may be the sweep candle
     "swing_n": 2,           # bars each side for a swing high/low
@@ -228,6 +231,8 @@ def find_setup(c, i):
             model = "Inside bar" if (b.high <= H and b.low >= L) else "3 candle"
         else:
             model = "Multiple candle"
+        if model not in CONFIG["models"]:
+            continue
 
         closes_inside = L <= s.close <= H
         need_close = CONFIG["sweep_confirm"] == "inside"
