@@ -13,6 +13,7 @@ Run:  python bot.py        (normal run)
 import json
 import os
 import sys
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -157,7 +158,7 @@ def resample(df, tf):
     if tf == "4H":
         r = df.resample("4h", offset="1h")  # 01,05,09,13,17,21
     else:
-        r = df.resample("1D", offset="17h")  # 17:00 to 17:00
+        r = df.resample("24h", offset="17h")  # 17:00 to 17:00 (24h, not 1D: pandas 3 ignores offset on 1D)
     return r.agg(AGG).dropna()
 
 
@@ -252,6 +253,7 @@ def find_setup(c, i):
             "H": float(H),
             "L": float(L),
             "c1_time": c.index[j],
+            "times": list(c.index[j : i + 1]),
             "sweep_time": c.index[i],
         }
     return None
@@ -316,26 +318,36 @@ def setup_prices(setup, mss):
     return mss["extreme"], (setup["H"] if buy else setup["L"])
 
 
+def to_local(ts):
+    """Bot candle time (New York clock) -> your clock (Lagos), no tz attached."""
+    t = pd.Timestamp(ts).tz_localize(CONFIG["tz"], ambiguous=True,
+                                     nonexistent="shift_forward")
+    return t.tz_convert(CONFIG["display_tz"]).tz_localize(None)
+
+
 def local_time(ts):
-    """Show a bot candle time in your own time zone."""
     try:
-        t = pd.Timestamp(ts).tz_localize(CONFIG["tz"], ambiguous=True,
-                                         nonexistent="shift_forward")
-        return t.tz_convert(CONFIG["display_tz"]).strftime("%a %d %b %H:%M")
+        return to_local(ts).strftime("%a %d %b %H:%M")
     except Exception:
         return str(ts)
 
 
-def build_message(pair, tf, ltf_tf, setup, mss, price, bias, source=""):
+def build_message(pair, tf, ltf_tf, setup, mss, price, bias, source="", closes_at=None):
     buy = setup["direction"] == "buy"
     head = f"{'🟢 BUY' if buy else '🔴 SELL'} {pair} | {TF_NAME[tf]} CRT ({setup['model']})"
     lines = [head, f"CRT H: {fmt(pair, setup['H'])}   CRT L: {fmt(pair, setup['L'])}"]
-    lines.append(f"CRT candle opened: {local_time(setup['c1_time'])}")
+    names = {0: "Candle 1 (range)"}
+    for k, t in enumerate(setup["times"]):
+        last = k == len(setup["times"]) - 1
+        name = "Candle %d (sweep)" % (k + 1) if last else names.get(k, "Candle %d" % (k + 1))
+        lines.append(f"{name}: {local_time(t)}")
+    if closes_at is not None:
+        lines.append(f"Sweep candle closes {local_time(closes_at)}. Valid only if it closes back inside CRT H/L.")
     if mss:
         stop, target = setup_prices(setup, mss)
         word = "above" if buy else "below"
         lines.append(f"Sweep {'low' if buy else 'high'}: {fmt(pair, stop)}")
-        lines.append(f"MSS on {ltf_tf}: closed {word} {fmt(pair, mss['level'])}")
+        lines.append(f"MSS on {ltf_tf}: closed {word} {fmt(pair, mss['level'])} (candle {local_time(mss['time'])})")
         lines.append(f"Stop: beyond {fmt(pair, stop)}")
         lines.append(f"Target: {fmt(pair, target)} (CRT {'H' if buy else 'L'})")
         rr_lvl = calc_rr(setup["direction"], mss["level"], stop, target)
@@ -344,20 +356,111 @@ def build_message(pair, tf, ltf_tf, setup, mss, price, bias, source=""):
         lines.append(f"RR from MSS level: {rr_lvl:.1f}   RR at price now: {rr_now:.1f}")
         lines.append("Next: find your POI on the chart.")
     else:
-        lines.append(f"Sweep seen. Waiting for the MSS on {ltf_tf}.")
+        lines.append(f"CRT confirmed: swept, then closed back inside the range. Waiting for the MSS on {ltf_tf}.")
     if usd_role(pair):
         lines.append(f"DXY weekly bias: {bias}")
+    lines.append("Times are Lagos time (UTC+1)")
     if source:
         lines.append(f"Data: {source}")
     return "\n".join(lines)
 
 
-def send(text):
+def draw_candles(ax, df):
+    from matplotlib.patches import Rectangle
+
+    for k, (o, h, l, c) in enumerate(zip(df.open, df.high, df.low, df.close)):
+        col = "#26a69a" if c >= o else "#ef5350"
+        ax.plot([k, k], [l, h], color=col, lw=1, zorder=2)
+        body = max(abs(c - o), (h - l) * 0.02)
+        ax.add_patch(Rectangle((k - 0.3, min(o, c)), 0.6, body, color=col, zorder=3))
+
+
+def set_time_axis(ax, df, step):
+    pos = list(range(0, len(df), step))
+    ax.set_xticks(pos)
+    ax.set_xticklabels([to_local(df.index[k]).strftime("%d %b\n%H:%M") for k in pos], fontsize=7)
+    ax.set_xlim(-1, len(df) + 4)
+    ax.grid(alpha=0.2)
+
+
+def make_chart(pair, tf, ltf_tf, crt, ltf, setup, mss, forming, path):
+    """Picture of what the bot sees: candles 1-3, CRT H/L, sweep, MSS."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    buy = setup["direction"] == "buy"
+    H, L = setup["H"], setup["L"]
+    times = setup["times"]
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.5, 9.5), dpi=110)
+
+    # top: the CRT timeframe, candles numbered
+    a = max(crt.index.get_loc(times[0]) - 4, 0)
+    top = crt.iloc[a:]
+    draw_candles(ax1, top)
+    ax1.axhline(H, color="#1565c0", ls="--", lw=1)
+    ax1.axhline(L, color="#6a1b9a", ls="--", lw=1)
+    ax1.text(len(top) + 0.5, H, " CRT H", color="#1565c0", fontsize=8, va="center")
+    ax1.text(len(top) + 0.5, L, " CRT L", color="#6a1b9a", fontsize=8, va="center")
+    rng = H - L
+    for k, t in enumerate(times):
+        x = top.index.get_loc(t)
+        ax1.text(x, top.high.iloc[x] + rng * 0.04, str(k + 1), ha="center",
+                 fontsize=11, fontweight="bold", color="black")
+    sx = top.index.get_loc(times[-1])
+    ext = top.low.iloc[sx] if buy else top.high.iloc[sx]
+    ax1.plot([sx], [ext], marker="x", color="black", ms=8, zorder=5)
+    ax1.set_ylim(min(L, top.low.min()) - rng * 0.15, max(H, top.high.max()) + rng * 0.2)
+    note = " (sweep candle still open)" if forming else ""
+    ax1.set_title(f"{'BUY' if buy else 'SELL'} {pair} | {TF_NAME[tf]} CRT ({setup['model']}){note}", fontsize=10)
+    set_time_axis(ax1, top, max(len(top) // 6, 1))
+
+    # bottom: lower timeframe, sweep and MSS
+    start = int(ltf.index.searchsorted(setup["sweep_time"]))
+    bot = ltf.iloc[max(start - 12, 0):]
+    if len(bot):
+        draw_candles(ax2, bot)
+        swept, swept_name = (L, "CRT L") if buy else (H, "CRT H")
+        ax2.axhline(swept, color="#6a1b9a" if buy else "#1565c0", ls="--", lw=1)
+        ax2.text(len(bot) + 0.5, swept, f" {swept_name}", fontsize=8, va="center")
+        if mss:
+            ax2.axhline(mss["level"], color="#ef6c00", ls=":", lw=1.2)
+            ax2.text(0, mss["level"], " MSS level", color="#ef6c00", fontsize=8, va="bottom")
+            ax2.axhline(mss["extreme"], color="black", ls=":", lw=1)
+            ax2.text(0, mss["extreme"], " sweep extreme / stop", fontsize=8, va="top")
+            if mss["time"] in bot.index:
+                mx = bot.index.get_loc(mss["time"])
+                ax2.annotate("MSS", xy=(mx, bot.close.iloc[mx]), xytext=(mx, mss["level"]),
+                             ha="center", fontsize=9, color="#ef6c00",
+                             arrowprops=dict(arrowstyle="->", color="#ef6c00"))
+        set_time_axis(ax2, bot, max(len(bot) // 6, 1))
+        ax2.set_title(f"{ltf_tf} view (Lagos time)", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def send(text, photo=None):
     tok = os.environ.get("TELEGRAM_TOKEN")
     chat = os.environ.get("TELEGRAM_CHAT_ID")
     if not tok or not chat:
         print("[no Telegram keys] " + text)
         return False
+    if photo:
+        try:
+            with open(photo, "rb") as f:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{tok}/sendPhoto",
+                    data={"chat_id": chat, "caption": text[:1000]},
+                    files={"photo": f},
+                    timeout=60,
+                )
+            if r.ok:
+                return True
+        except Exception as e:
+            print(f"  photo error: {e}")
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{tok}/sendMessage",
@@ -386,6 +489,21 @@ def save_state(state, now):
 
 
 # -------------------------------------------------------------------- RUN
+def alert(pair, tf, ltf_tf, crt, ltf, setup, mss, price, bias, source, now):
+    """Build the text and chart, then send. Returns True if sent."""
+    end = setup["sweep_time"] + DELTA[tf]
+    forming = end > now
+    closes_at = end if (forming and CONFIG["sweep_confirm"] == "inside") else None
+    msg = build_message(pair, tf, ltf_tf, setup, mss, price, bias, source, closes_at)
+    photo = None
+    try:
+        path = os.path.join(tempfile.gettempdir(), "crt_chart.png")
+        photo = make_chart(pair, tf, ltf_tf, crt, ltf, setup, mss, forming, path)
+    except Exception as e:
+        print(f"  chart error: {e}")
+    return send(msg, photo)
+
+
 def run():
     now = pd.Timestamp.now(tz=CONFIG["tz"]).tz_localize(None)
     state = load_state()
@@ -407,7 +525,7 @@ def run():
             continue
         price = float(df.close.iloc[-1])
         for tf, ltf_tf in CONFIG["crt_timeframes"].items():
-            crt = resample(df, tf)
+            crt = drop_forming(resample(df, tf), tf, now)  # closed candles only
             ltf = drop_forming(resample(df, ltf_tf), ltf_tf, now)
             n = len(crt)
             for i in range(n - 1, max(n - 1 - CONFIG["lookback_sweeps"], 0), -1):
@@ -424,12 +542,10 @@ def run():
                     if rr < CONFIG["min_rr"]:
                         print(f"  {pair} {tf}: skipped, RR {rr:.1f} below {CONFIG['min_rr']}")
                     elif key not in state["sent"]:
-                        msg = build_message(pair, tf, ltf_tf, setup, mss, price, bias, source)
-                        if send(msg):
+                        if alert(pair, tf, ltf_tf, crt, ltf, setup, mss, price, bias, source, now):
                             state["sent"][key] = now.isoformat()
                 elif CONFIG["alert_on_sweep"] and key + "|sweep" not in state["sent"]:
-                    msg = build_message(pair, tf, ltf_tf, setup, None, price, bias, source)
-                    if send(msg):
+                    if alert(pair, tf, ltf_tf, crt, ltf, setup, None, price, bias, source, now):
                         state["sent"][key + "|sweep"] = now.isoformat()
             print(f"{pair} {tf}: checked")
     save_state(state, now)
