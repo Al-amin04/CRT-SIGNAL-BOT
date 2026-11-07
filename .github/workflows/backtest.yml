@@ -6,6 +6,9 @@ on:
       years:
         description: "Years of history"
         default: "5"
+      extra_pairs:
+        description: "Add 6 more pairs for more trades (yes or no)"
+        default: "no"
 
 permissions:
   contents: read
@@ -24,6 +27,7 @@ jobs:
       - run: python backtest.py
         env:
           BACKTEST_YEARS: ${{ github.event.inputs.years }}
+          BACKTEST_EXTRA: ${{ github.event.inputs.extra_pairs }}
           OANDA_TOKEN: ${{ secrets.OANDA_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
