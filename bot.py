@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 import numpy as np
 import pandas as pd
@@ -45,6 +46,11 @@ CONFIG = {
     # CRT models the bot may alert on. All four:
     # ["2 candle", "3 candle", "Inside bar", "Multiple candle"]
     "models": ["3 candle", "Inside bar"],
+    # Rules from the Rowdy FX book:
+    # sweep candle must close in the trade direction (down-close for a sell)
+    "require_sweep_candle_direction": True,
+    # candle 1 body must be at least this share of its range (long body, small wicks)
+    "min_body_ratio": 0.5,
     # Skip entry alerts whose RR is below this. RR is measured if you enter on a
     # retest of the broken MSS level, with stop at the sweep and target at the
     # opposite CRT level. Set 0 to turn the filter off.
@@ -105,23 +111,32 @@ def fetch_1h(tickers):
     return None
 
 
+def oanda_get(inst, params):
+    """Fetch OANDA candles. Retries 3 times and reports OANDA's own error text."""
+    headers = {"Authorization": f"Bearer {os.environ['OANDA_TOKEN']}"}
+    url = f"https://{CONFIG['oanda_host']}/v3/instruments/{inst}/candles"
+    last = ""
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=30)
+            if r.ok:
+                return r.json()["candles"]
+            last = f"HTTP {r.status_code}: {r.text[:200]}"
+        except Exception as e:
+            last = str(e)
+        time.sleep(2 * (attempt + 1))
+    raise RuntimeError(last)
+
+
 def fetch_oanda_1h(pair):
     """OANDA 1H candles. Same index format as fetch_1h."""
-    tok = os.environ.get("OANDA_TOKEN")
-    if not tok:
+    if not os.environ.get("OANDA_TOKEN"):
         return None
     price = CONFIG["oanda_price"]
     key = {"M": "mid", "B": "bid", "A": "ask"}[price]
-    inst = f"{pair[:3]}_{pair[3:]}"
     try:
-        r = requests.get(
-            f"https://{CONFIG['oanda_host']}/v3/instruments/{inst}/candles",
-            headers={"Authorization": f"Bearer {tok}"},
-            params={"granularity": "H1", "count": 1000, "price": price},
-            timeout=30,
-        )
-        r.raise_for_status()
-        candles = r.json()["candles"]
+        candles = oanda_get(f"{pair[:3]}_{pair[3:]}",
+                            {"granularity": "H1", "count": 1000, "price": price})
     except Exception as e:
         print(f"  OANDA error {pair}: {e}")
         return None
@@ -217,7 +232,15 @@ def weekly_bias(dxy_1h, now):
 
 # ---------------------------------------------------------- CRT DETECTION
 def find_setup(c, i):
-    """Candle i is the sweep candle. Look back for candle 1 (the CRT range)."""
+    """Candle i is the sweep candle. Look back for candle 1 (the CRT range).
+
+    Models (book definitions):
+    - 3 candle:  candle 2 sweeps and closes back inside, still short of the 50% line.
+                 Candle 3 is the move.
+    - 2 candle:  candle 2 sweeps and already closed past the 50% line.
+    - Inside bar: candle 2 sits fully inside candle 1, candle 3 sweeps.
+    - Multiple candle: several candles close inside, then one sweeps.
+    """
     s = c.iloc[i]
     # widest range first, so an inside bar is judged against its mother candle
     for m in range(CONFIG["max_between"] + 1, 0, -1):
@@ -226,17 +249,13 @@ def find_setup(c, i):
             continue
         c1 = c.iloc[j]
         H, L = c1.high, c1.low
+        if H <= L:
+            continue
+        ratio = abs(c1.close - c1.open) / (H - L)
+        if ratio < CONFIG["min_body_ratio"]:
+            continue
         between = c.iloc[j + 1 : i]
         if len(between) and not ((between.close <= H) & (between.close >= L)).all():
-            continue
-        if m == 1:
-            model = "2 candle"
-        elif m == 2:
-            b = between.iloc[0]
-            model = "Inside bar" if (b.high <= H and b.low >= L) else "3 candle"
-        else:
-            model = "Multiple candle"
-        if model not in CONFIG["models"]:
             continue
 
         closes_inside = L <= s.close <= H
@@ -247,6 +266,22 @@ def find_setup(c, i):
             direction = "sell"
         else:
             continue
+        buy = direction == "buy"
+        dir_ok = bool(s.close > s.open) if buy else bool(s.close < s.open)
+        if CONFIG["require_sweep_candle_direction"] and not dir_ok:
+            continue
+
+        mid = (H + L) / 2
+        if m == 1:
+            past_mid = s.close >= mid if buy else s.close <= mid
+            model = "2 candle" if past_mid else "3 candle"
+        elif m == 2:
+            b = between.iloc[0]
+            model = "Inside bar" if (b.high <= H and b.low >= L) else "Multiple candle"
+        else:
+            model = "Multiple candle"
+        if model not in CONFIG["models"]:
+            continue
         return {
             "model": model,
             "direction": direction,
@@ -255,6 +290,8 @@ def find_setup(c, i):
             "c1_time": c.index[j],
             "times": list(c.index[j : i + 1]),
             "sweep_time": c.index[i],
+            "c1_ratio": float(ratio),
+            "dir_ok": dir_ok,
         }
     return None
 

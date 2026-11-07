@@ -25,10 +25,11 @@ import requests
 
 import bot
 
-YEARS = float(os.environ.get("BACKTEST_YEARS") or 2)
+YEARS = float(os.environ.get("BACKTEST_YEARS") or 5)
 ENTRY_WAIT_BARS = 24      # hours to wait for the retest
 MAX_HOLD_BARS = 240       # hours before a trade is closed at market
-RR_STEPS = [0, 1.5, 2, 3]
+TIMING_HOURS = (1, 5, 9)   # New York hour a 4H sweep candle opens (book's 'time and price')
+MIN_BODY = 0.5
 ALL_MODELS = ["2 candle", "3 candle", "Inside bar", "Multiple candle"]
 YOUR_MODELS = ["3 candle", "Inside bar"]
 
@@ -44,19 +45,12 @@ def load_oanda(pair, years):
     start = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=int(365 * years))
     rows = []
     while True:
-        r = requests.get(
-            f"https://{bot.CONFIG['oanda_host']}/v3/instruments/{inst}/candles",
-            headers={"Authorization": f"Bearer {tok}"},
-            params={
-                "granularity": "H1",
-                "count": 5000,
-                "price": bot.CONFIG["oanda_price"],
-                "from": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        cs = r.json()["candles"]
+        cs = bot.oanda_get(inst, {
+            "granularity": "H1",
+            "count": 5000,
+            "price": bot.CONFIG["oanda_price"],
+            "from": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
         if not cs:
             break
         for c in cs:
@@ -166,11 +160,9 @@ def find_trades(pair, h1, dxy, bias_cache):
                     break
             if not mss:
                 continue
-            stop, target = bot.setup_prices(setup, mss)
+            stop, target_full = bot.setup_prices(setup, mss)
+            target_half = (setup["H"] + setup["L"]) / 2
             alert_t = max(mss_close, s0 + dlt)
-            res = simulate(h1, setup["direction"], mss["level"], stop, target, alert_t)
-            if not res:
-                continue
             # DXY weekly bias that was known at the time
             wk = week_key(s0)
             if dxy is not None and wk not in bias_cache:
@@ -183,9 +175,15 @@ def find_trades(pair, h1, dxy, bias_cache):
                 bias_ok = None          # unknown, excluded from the "with bias" view
             else:
                 bias_ok = setup["direction"] in bot.allowed_directions(pair, bias)
-            res.update(pair=pair, tf=tf, model=setup["model"], direction=setup["direction"],
-                       alert_time=alert_t, bias_ok=bias_ok)
-            trades.append(res)
+            for tname, tgt in (("full", target_full), ("half", target_half)):
+                res = simulate(h1, setup["direction"], mss["level"], stop, tgt, alert_t)
+                if not res:
+                    continue
+                res.update(pair=pair, tf=tf, model=setup["model"], direction=setup["direction"],
+                           alert_time=alert_t, bias_ok=bias_ok, target=tname,
+                           c1_ratio=setup["c1_ratio"], dir_ok=setup["dir_ok"],
+                           hour=s0.hour)
+                trades.append(res)
     return trades
 
 
@@ -207,12 +205,20 @@ def stats(trades):
             f"total {R.sum():+.1f}R | PF {pf:.1f} | maxDD {dd:.1f}R | worst streak {streak}")
 
 
-def pick(trades, models=None, min_rr=0, bias=False, **eq):
+def pick(trades, models=None, target="full", direction=False, quality=False,
+         timing=False, bias=False, **eq):
+    """Filter simulated trades. The flags are the book rules being tested."""
     out = []
     for t in trades:
+        if t["target"] != target:
+            continue
         if models and t["model"] not in models:
             continue
-        if t["rr"] < min_rr:
+        if direction and not t["dir_ok"]:
+            continue
+        if quality and t["c1_ratio"] < MIN_BODY:
+            continue
+        if timing and t["tf"] == "4H" and t["hour"] not in TIMING_HOURS:
             continue
         if bias and t["bias_ok"] is not True:
             continue
@@ -223,28 +229,40 @@ def pick(trades, models=None, min_rr=0, bias=False, **eq):
 
 
 def report(trades, pairs, years, has_dxy):
-    L = [f"CRT BACKTEST | {years:g}y OANDA {bot.CONFIG['oanda_price']} | pairs: {len(pairs)}",
-         "Entry = retest of MSS level, stop = sweep, target = opposite CRT level.",
-         "Spread and slippage ignored. Real results are worse.", ""]
-    L.append("YOUR MODELS (3 candle + inside bar), by min RR:")
-    for rr in RR_STEPS:
-        L.append(f"RR>={rr}: " + stats(pick(trades, YOUR_MODELS, rr)))
+    L = [f"CRT BACKTEST v2 | {years:g}y OANDA {bot.CONFIG['oanda_price']} | pairs: {len(pairs)}",
+         "Models per the book: 3 candle = candle 2 sweeps, candle 3 is the move.",
+         "Entry = retest of MSS level, stop = sweep, target = full range ('full')",
+         "or the 50% line ('half'). No min RR. Spread ignored: real results are worse.",
+         "", "YOUR MODELS (3 candle + inside bar), one rule added at a time:"]
+    variants = [
+        ("A baseline", {}),
+        ("B +candle2 direction", {"direction": True}),
+        ("C +candle1 body>=50%", {"quality": True}),
+        ("D = B+C", {"direction": True, "quality": True}),
+        ("E = D+1/5/9am NY (4H)", {"direction": True, "quality": True, "timing": True}),
+    ]
     if has_dxy:
-        L += ["", "Same, with DXY weekly bias filter:"]
-        for rr in RR_STEPS:
-            L.append(f"RR>={rr}: " + stats(pick(trades, YOUR_MODELS, rr, bias=True)))
-    else:
-        L += ["", "DXY data failed: bias filter not tested."]
-    L += ["", "BY MODEL (RR>=2, no bias filter):"]
+        variants.append(("F = D+DXY bias", {"direction": True, "quality": True, "bias": True}))
+    for name, kw in variants:
+        L.append(name)
+        for tg_ in ("full", "half"):
+            L.append(f"  {tg_}: " + stats(pick(trades, YOUR_MODELS, tg_, **kw)))
+    if not has_dxy:
+        L.append("DXY data failed: bias filter not tested.")
+    D = {"direction": True, "quality": True}
+    L += ["", "BY MODEL (rules B+C):"]
     for m in ALL_MODELS:
-        L.append(f"{m}: " + stats(pick(trades, [m], 2)))
-    L += ["", "BY TIMEFRAME (your models, RR>=2):"]
+        for tg_ in ("full", "half"):
+            L.append(f"{m} {tg_}: " + stats(pick(trades, [m], tg_, **D)))
+    L += ["", "BY TIMEFRAME (your models, B+C):"]
     for tf in bot.CONFIG["crt_timeframes"]:
-        L.append(f"{bot.TF_NAME[tf]}: " + stats(pick(trades, YOUR_MODELS, 2, tf=tf)))
-    L += ["", "BY PAIR (your models, RR>=2):"]
+        for tg_ in ("full", "half"):
+            L.append(f"{bot.TF_NAME[tf]} {tg_}: " + stats(pick(trades, YOUR_MODELS, tg_, tf=tf, **D)))
+    L += ["", "BY PAIR (your models, B+C, full target):"]
     for p in pairs:
-        L.append(f"{p}: " + stats(pick(trades, YOUR_MODELS, 2, pair=p)))
-    L += ["", "Small samples mean little. Under about 30 trades, treat results as noise."]
+        L.append(f"{p}: " + stats(pick(trades, YOUR_MODELS, "full", pair=p, **D)))
+    L += ["", "Under about 30 trades, treat results as noise. Many variants on",
+          "one data set can flatter any rule: do not pick the best row."]
     return "\n".join(L)
 
 
@@ -267,7 +285,7 @@ def tg(text=None, doc=None):
 
 
 def save_csv(trades, path):
-    cols = ["pair", "tf", "model", "direction", "alert_time", "entry_time", "rr", "R", "outcome", "bias_ok"]
+    cols = ["pair", "tf", "model", "direction", "target", "alert_time", "entry_time", "rr", "R", "outcome", "bias_ok", "c1_ratio", "dir_ok", "hour"]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
@@ -280,6 +298,8 @@ def main(loader=None, dxy=None, dxy_loaded=False):
     loader = loader or load_oanda
     bot.CONFIG["dxy_bias"] = "auto"
     bot.CONFIG["models"] = ALL_MODELS
+    bot.CONFIG["require_sweep_candle_direction"] = False   # tested afterwards as a filter
+    bot.CONFIG["min_body_ratio"] = 0.0                      # tested afterwards as a filter
     if not dxy_loaded:
         dxy = load_dxy()
     trades, used, cache = [], [], {}
