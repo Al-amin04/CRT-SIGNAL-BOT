@@ -1,16 +1,17 @@
-"""Backtest of the CRT bot rules on past OANDA data. Sends the summary to Telegram.
+"""Backtest v4 of the CRT bot rules on past OANDA data. Sends the summary to Telegram.
 
 Uses the same detection code as bot.py (CRT range, model, sweep, MSS).
 It walks forward candle by candle, so it never uses future data to find a setup.
 
-Mechanical entry rules (your real entry is by eye, so this is an estimate):
-- Alert fires when the sweep candle has closed AND the MSS has closed.
-- Entry: limit order on a retest of the broken MSS level.
-- Stop: the sweep extreme. Target: the opposite CRT level.
-- Order is cancelled if price hits the stop or target before the retest,
-  or if there is no retest within ENTRY_WAIT_BARS hours.
+Rules tested (your plan):
+- Higher timeframe bias of each market itself (no DXY): 3 definitions compared.
+- Alert fires when the sweep candle has closed AND the MSS candle has closed.
+- Entry: limit order on a RETEST of the level the MSS broke (24h wait, else cancelled).
+- Stop: beyond the sweep extreme, or beyond the last swing before the break ("protected").
+- Target: the opposite CRT level. Minimum RR 1:2 (counted from the entry).
 - If stop and target fall in the same 1H candle, the stop counts first.
-- Spread, slippage and commission are ignored. Real results will be worse.
+- Spreads are assumed. Real results will differ.
+- Tuning period and a hold-out period (last 18 months) are reported separately.
 
 Run:  python backtest.py            (needs OANDA_TOKEN; BACKTEST_YEARS optional)
 """
@@ -26,12 +27,22 @@ import requests
 import bot
 
 YEARS = float(os.environ.get("BACKTEST_YEARS") or 5)
+EXTRA = (os.environ.get("BACKTEST_EXTRA") or "no").lower() == "yes"
 ENTRY_WAIT_BARS = 24      # hours to wait for the retest
 MAX_HOLD_BARS = 240       # hours before a trade is closed at market
-TIMING_HOURS = (1, 5, 9)   # New York hour a 4H sweep candle opens (book's 'time and price')
-MIN_BODY = 0.5
-ALL_MODELS = ["2 candle", "3 candle", "Inside bar", "Multiple candle"]
+MIN_BODY = 0.5            # candle 1 body share (book rule)
+HOLDOUT_DAYS = 548        # last ~18 months are kept apart
+MIN_TRADES = 30           # a rule set needs this many tuning trades to be chosen
+BIASES = ("none", "struct", "week", "ma")
+STOPS = ("extreme", "protected")
 YOUR_MODELS = ["3 candle", "Inside bar"]
+EXTRA_PAIRS = {"EURJPY": ["EURJPY=X"], "EURGBP": ["EURGBP=X"], "AUDJPY": ["AUDJPY=X"],
+               "NZDJPY": ["NZDJPY=X"], "USDCHF": ["USDCHF=X"], "CADJPY": ["CADJPY=X"]}
+# Assumed typical spreads in price units. These are guesses, not your broker's numbers.
+SPREADS = {"EURUSD": 0.00010, "GBPUSD": 0.00015, "USDJPY": 0.012, "GBPJPY": 0.025,
+           "AUDUSD": 0.00012, "USDCAD": 0.00015, "NZDUSD": 0.00018,
+           "XAUUSD": 0.35, "XAGUSD": 0.04, "EURJPY": 0.020, "EURGBP": 0.00015,
+           "AUDJPY": 0.025, "NZDJPY": 0.030, "USDCHF": 0.00015, "CADJPY": 0.030}
 
 
 # ------------------------------------------------------------------- DATA
@@ -70,74 +81,66 @@ def load_oanda(pair, years):
     return df[~df.index.duplicated(keep="last")].sort_index()
 
 
-def load_dxy():
-    df = None
-    try:
-        import yfinance as yf
-
-        raw = yf.download("DX-Y.NYB", period="730d", interval="1h", progress=False, auto_adjust=False)
-        if raw is not None and not raw.empty:
-            if isinstance(raw.columns, pd.MultiIndex):
-                raw.columns = raw.columns.get_level_values(0)
-            df = raw[["Open", "High", "Low", "Close"]].dropna()
-            df.columns = ["open", "high", "low", "close"]
-            idx = df.index
-            if idx.tz is None:
-                idx = idx.tz_localize("UTC")
-            df.index = idx.tz_convert(bot.CONFIG["tz"]).tz_localize(None)
-            df = df[~df.index.duplicated(keep="last")].sort_index()
-    except Exception as e:
-        print(f"DXY error: {e}")
-    return df
-
-
 # ------------------------------------------------------------- SIMULATION
-def week_key(ts):
-    k = ts + pd.Timedelta(hours=7)
-    return (k - pd.Timedelta(days=k.weekday())).normalize()
-
-
 def simulate(h1, direction, level, stop, target, t0):
-    """Walk 1H candles from t0. Returns dict(R, outcome, entry_time, rr) or None."""
+    """Walk 1H candles from t0. Returns a trade dict, or {"skip": reason}.
+
+    mfe = best move in R after entry before the stop was hit (measured past the target too).
+    """
     sg = 1 if direction == "buy" else -1
     hi = h1.high.values if sg == 1 else -h1.low.values
     lo = h1.low.values if sg == 1 else -h1.high.values
     cl = h1.close.values * sg
     lev, stp, tgt = level * sg, stop * sg, target * sg
     if not (stp < lev < tgt):
-        return None
-    rr = (tgt - lev) / (lev - stp)
+        return {"skip": "geometry"}
+    risk = lev - stp
+    rr = (tgt - lev) / risk
     pos = int(h1.index.searchsorted(t0))
     end = min(pos + ENTRY_WAIT_BARS, len(h1))
     fill = None
     for k in range(pos, end):
         if lo[k] > lev:                 # not touched yet
             if hi[k] >= tgt:
-                return None             # ran to target with no retest
+                return {"skip": "ran"}  # ran to target with no retest
             continue
         if lo[k] <= stp:                # touched, then stopped, same candle
-            return {"R": -1.0, "outcome": "loss", "entry_time": h1.index[k], "rr": rr}
+            return {"R": -1.0, "outcome": "loss", "entry_time": h1.index[k], "rr": rr, "mfe": 0.0}
         if hi[k] >= tgt:
-            return None                 # order of events unknown
+            return {"skip": "amb"}      # order of events unknown
         fill = k
         break
     if fill is None:
-        return None
+        return {"skip": "nofill"}
     last = min(fill + 1 + MAX_HOLD_BARS, len(h1))
+    result, mfe = None, 0.0
     for m in range(fill + 1, last):
         if lo[m] <= stp:
-            return {"R": -1.0, "outcome": "loss", "entry_time": h1.index[fill], "rr": rr}
-        if hi[m] >= tgt:
-            return {"R": rr, "outcome": "win", "entry_time": h1.index[fill], "rr": rr}
-    if last - 1 <= fill:
-        return None
-    r = (cl[last - 1] - lev) / (lev - stp)
-    return {"R": r, "outcome": "timeout", "entry_time": h1.index[fill], "rr": rr}
+            if result is None:
+                result = ("loss", -1.0)
+            break
+        mfe = max(mfe, (hi[m] - lev) / risk)
+        if result is None and hi[m] >= tgt:
+            result = ("win", rr)
+    if result is None:
+        if last - 1 <= fill:
+            return {"skip": "short"}
+        result = ("timeout", (cl[last - 1] - lev) / risk)
+    return {"R": result[1], "outcome": result[0], "entry_time": h1.index[fill],
+            "rr": rr, "mfe": mfe}
 
 
-def find_trades(pair, h1, dxy, bias_cache):
-    trades = []
+def find_trades(pair, h1):
+    """All setups with an MSS, simulated for both stop styles.
+
+    Returns (trades, signals). Signals record whether each MSS got a retest fill.
+    """
+    trades, signals = [], []
     now = h1.index[-1] + pd.Timedelta(hours=1)
+    daily = bot.drop_forming(bot.resample(h1, "1D"), "1D", now)
+    daily_end = daily.index + pd.Timedelta(days=1)
+    buf = bot.STOP_BUFFER.get(pair, 0.0)
+    spread = SPREADS.get(pair, 0.0)
     for tf, ltf_tf in bot.CONFIG["crt_timeframes"].items():
         crt = bot.drop_forming(bot.resample(h1, tf), tf, now)
         ltf = bot.drop_forming(bot.resample(h1, ltf_tf), ltf_tf, now)
@@ -149,7 +152,7 @@ def find_trades(pair, h1, dxy, bias_cache):
             s0 = setup["sweep_time"]
             pos0 = int(ltf.index.searchsorted(s0))
             limit = s0 + 3 * dlt        # same window the live bot allows
-            mss = None
+            mss = window = None
             for k in range(pos0, len(ltf)):
                 if ltf.index[k] + ldt > limit:
                     break
@@ -160,31 +163,25 @@ def find_trades(pair, h1, dxy, bias_cache):
                     break
             if not mss:
                 continue
-            stop, target_full = bot.setup_prices(setup, mss)
-            target_half = (setup["H"] + setup["L"]) / 2
             alert_t = max(mss_close, s0 + dlt)
-            # DXY weekly bias that was known at the time
-            wk = week_key(s0)
-            if dxy is not None and wk not in bias_cache:
-                bias_cache[wk] = bot.weekly_bias(dxy[dxy.index < s0], s0)
-            bias = bias_cache.get(wk)
-            role = bot.usd_role(pair)
-            if role is None:
-                bias_ok = True
-            elif bias is None:
-                bias_ok = None          # unknown, excluded from the "with bias" view
-            else:
-                bias_ok = setup["direction"] in bot.allowed_directions(pair, bias)
-            for tname, tgt in (("full", target_full), ("half", target_half)):
-                res = simulate(h1, setup["direction"], mss["level"], stop, tgt, alert_t)
-                if not res:
+            # higher timeframe bias known at the sweep candle's open
+            d_slice = daily.iloc[: int(np.searchsorted(daily_end.values, np.datetime64(s0), side="right"))]
+            bias = {md: bot.bias_from_daily(d_slice, md, s0) for md in ("struct", "week", "ma")}
+            target = setup["H"] if setup["direction"] == "buy" else setup["L"]
+            base = dict(pair=pair, tf=tf, model=setup["model"], direction=setup["direction"],
+                        alert_time=alert_t, c1_ratio=setup["c1_ratio"], dir_ok=setup["dir_ok"],
+                        hour=s0.hour, bias_struct=bias["struct"], bias_week=bias["week"],
+                        bias_ma=bias["ma"])
+            for sm in STOPS:
+                stop = bot.mss_stop(window, setup["direction"], mss, sm, buf)
+                res = simulate(h1, setup["direction"], mss["level"], stop, target, alert_t)
+                if sm == "extreme":
+                    signals.append(dict(base, reason=res.get("skip", "filled")))
+                if "skip" in res:
                     continue
-                res.update(pair=pair, tf=tf, model=setup["model"], direction=setup["direction"],
-                           alert_time=alert_t, bias_ok=bias_ok, target=tname,
-                           c1_ratio=setup["c1_ratio"], dir_ok=setup["dir_ok"],
-                           hour=s0.hour)
-                trades.append(res)
-    return trades
+                res["R"] -= spread / abs(mss["level"] - stop)     # entry cost in R
+                trades.append(dict(res, **base, stop_mode=sm))
+    return trades, signals
 
 
 # ------------------------------------------------------------------ STATS
@@ -202,25 +199,30 @@ def stats(trades):
         cur = cur + 1 if r <= 0 else 0
         streak = max(streak, cur)
     return (f"{len(R)} trades | win {100 * len(wins) / len(R):.0f}% | avg {R.mean():+.2f}R | "
-            f"total {R.sum():+.1f}R | PF {pf:.1f} | maxDD {dd:.1f}R | worst streak {streak}")
+            f"total {R.sum():+.1f}R | PF {pf:.1f} | maxDD {dd:.1f}R | streak {streak}")
 
 
-def pick(trades, models=None, target="full", direction=False, quality=False,
-         timing=False, bias=False, **eq):
-    """Filter simulated trades. The flags are the book rules being tested."""
+def allowed(t, bias):
+    if bias == "none":
+        return True
+    return t["bias_" + bias] == (1 if t["direction"] == "buy" else -1)
+
+
+def pick(rows, bias="none", stop=None, min_rr=0, since=None, until=None, **eq):
+    """Filter trades or signals. Book rules (candle 2 direction, candle 1 body) are on."""
     out = []
-    for t in trades:
-        if t["target"] != target:
+    for t in rows:
+        if t["model"] not in YOUR_MODELS or not t["dir_ok"] or t["c1_ratio"] < MIN_BODY:
             continue
-        if models and t["model"] not in models:
+        if stop is not None and t["stop_mode"] != stop:
             continue
-        if direction and not t["dir_ok"]:
+        if t.get("rr", 99) < min_rr:
             continue
-        if quality and t["c1_ratio"] < MIN_BODY:
+        if since is not None and t["alert_time"] < since:
             continue
-        if timing and t["tf"] == "4H" and t["hour"] not in TIMING_HOURS:
+        if until is not None and t["alert_time"] >= until:
             continue
-        if bias and t["bias_ok"] is not True:
+        if not allowed(t, bias):
             continue
         if any(t[k] != v for k, v in eq.items()):
             continue
@@ -228,41 +230,73 @@ def pick(trades, models=None, target="full", direction=False, quality=False,
     return out
 
 
-def report(trades, pairs, years, has_dxy):
-    L = [f"CRT BACKTEST v2 | {years:g}y OANDA {bot.CONFIG['oanda_price']} | pairs: {len(pairs)}",
-         "Models per the book: 3 candle = candle 2 sweeps, candle 3 is the move.",
-         "Entry = retest of MSS level, stop = sweep, target = full range ('full')",
-         "or the 50% line ('half'). No min RR. Spread ignored: real results are worse.",
-         "", "YOUR MODELS (3 candle + inside bar), one rule added at a time:"]
-    variants = [
-        ("A baseline", {}),
-        ("B +candle2 direction", {"direction": True}),
-        ("C +candle1 body>=50%", {"quality": True}),
-        ("D = B+C", {"direction": True, "quality": True}),
-        ("E = D+1/5/9am NY (4H)", {"direction": True, "quality": True, "timing": True}),
-    ]
-    if has_dxy:
-        variants.append(("F = D+DXY bias", {"direction": True, "quality": True, "bias": True}))
-    for name, kw in variants:
-        L.append(name)
-        for tg_ in ("full", "half"):
-            L.append(f"  {tg_}: " + stats(pick(trades, YOUR_MODELS, tg_, **kw)))
-    if not has_dxy:
-        L.append("DXY data failed: bias filter not tested.")
-    D = {"direction": True, "quality": True}
-    L += ["", "BY MODEL (rules B+C):"]
-    for m in ALL_MODELS:
-        for tg_ in ("full", "half"):
-            L.append(f"{m} {tg_}: " + stats(pick(trades, [m], tg_, **D)))
-    L += ["", "BY TIMEFRAME (your models, B+C):"]
-    for tf in bot.CONFIG["crt_timeframes"]:
-        for tg_ in ("full", "half"):
-            L.append(f"{bot.TF_NAME[tf]} {tg_}: " + stats(pick(trades, YOUR_MODELS, tg_, tf=tf, **D)))
-    L += ["", "BY PAIR (your models, B+C, full target):"]
-    for p in pairs:
-        L.append(f"{p}: " + stats(pick(trades, YOUR_MODELS, "full", pair=p, **D)))
-    L += ["", "Under about 30 trades, treat results as noise. Many variants on",
-          "one data set can flatter any rule: do not pick the best row."]
+def avg_r(rows):
+    return np.mean([t["R"] for t in rows]) if rows else -9
+
+
+def mfe_line(trades):
+    if not trades:
+        return "no trades"
+    m = np.array([t["mfe"] for t in trades])
+    parts = [f"+{x:g}R {100 * (m >= x).mean():.0f}%" for x in (0.5, 1, 1.5, 2, 3)]
+    return f"{len(m)} trades, price reached: " + " | ".join(parts)
+
+
+def report(trades, signals, pairs, years):
+    split = max(t["alert_time"] for t in trades + signals) - pd.Timedelta(days=HOLDOUT_DAYS) if (trades or signals) else None
+    RR = 2.0
+    L = [f"CRT BACKTEST v4 | {years:g}y OANDA {bot.CONFIG['oanda_price']} | pairs: {len(pairs)}",
+         "Models: 3 candle + inside bar. Book rules on (candle 2 direction, candle 1 body >= 50%).",
+         "Entry = limit on retest of the MSS level (24h wait). Target = opposite CRT level.",
+         f"Min RR {RR:g} counted from the entry. Stop has a ~1.5 pip buffer. R is net of ASSUMED spreads.",
+         f"TUNING = before {split:%Y-%m-%d}. HOLD-OUT = after (about 18 months). Choose from tuning only.", ""]
+
+    sig_t = pick(signals, until=split)
+    n = len(sig_t)
+    if n:
+        c = {k: sum(1 for t in sig_t if t["reason"] == k) for k in ("filled", "ran", "nofill", "geometry", "amb", "short")}
+        L.append(f"FILL RATE (tuning, {n} MSS signals, no RR filter): filled {100 * c['filled'] / n:.0f}%, "
+                 f"ran to target with no retest {100 * c['ran'] / n:.0f}%, never retested {100 * c['nofill'] / n:.0f}%, "
+                 f"MSS level already past the target {100 * c['geometry'] / n:.0f}%, "
+                 f"unclear {100 * (c['amb'] + c['short']) / n:.0f}%")
+    L += ["", f"TUNING PERIOD, RR >= {RR:g}: bias x stop"]
+    rows = {}
+    for b in BIASES:
+        for sm in STOPS:
+            sel = pick(trades, b, sm, RR, until=split)
+            rows[(b, sm)] = sel
+            L.append(f"  {b}/{sm}: " + stats(sel))
+    L += ["", "RR THRESHOLD CONTEXT (tuning, no bias, extreme stop):"]
+    for r in (0, 1.5, 2, 3):
+        L.append(f"  RR >= {r:g}: " + stats(pick(trades, "none", "extreme", r, until=split)))
+
+    elig = {k: v for k, v in rows.items() if len(v) >= MIN_TRADES}
+    base_hold = pick(trades, "none", "extreme", RR, since=split)
+    if elig:
+        best = max(elig, key=lambda k: avg_r(elig[k]))
+        b, sm = best
+        L += ["", f"CHOSEN BY A FIXED RULE (best average R on tuning with >= {MIN_TRADES} trades): bias={b}, stop={sm}",
+              "  tuning:   " + stats(rows[best]),
+              "  HOLD-OUT: " + stats(pick(trades, b, sm, RR, since=split)),
+              "BASELINE (no bias, extreme stop) on HOLD-OUT: " + stats(base_hold)]
+        allsel = pick(trades, b, sm, RR)
+        if allsel:
+            rrs = np.mean([t["rr"] for t in allsel])
+            L += ["", f"BREAK-EVEN: planned RR averages {rrs:.1f}, so the win rate must beat {100 / (1 + rrs):.0f}% before costs."]
+        L += ["", "HOW FAR TRADES RUN before the stop (chosen rule, all data):", "  " + mfe_line(allsel),
+              "", "CHOSEN RULE BY MODEL (all data):"]
+        for m in YOUR_MODELS:
+            L.append(f"  {m}: " + stats(pick(trades, b, sm, RR, model=m)))
+        L += ["", "CHOSEN RULE BY TIMEFRAME (all data):"]
+        for tf in bot.CONFIG["crt_timeframes"]:
+            L.append(f"  {bot.TF_NAME[tf]}: " + stats(pick(trades, b, sm, RR, tf=tf)))
+        L += ["", "CHOSEN RULE BY PAIR (all data, small samples):"]
+        for p in pairs:
+            L.append(f"  {p}: " + stats(pick(trades, b, sm, RR, pair=p)))
+    else:
+        L += ["", f"No rule set reached {MIN_TRADES} trades in the tuning period. Too few to conclude.",
+              "BASELINE (no bias, extreme stop) on HOLD-OUT: " + stats(base_hold)]
+    L += ["", "Rule: pick from TUNING, read HOLD-OUT once. Under about 30 trades is noise."]
     return "\n".join(L)
 
 
@@ -285,25 +319,24 @@ def tg(text=None, doc=None):
 
 
 def save_csv(trades, path):
-    cols = ["pair", "tf", "model", "direction", "target", "alert_time", "entry_time", "rr", "R", "outcome", "bias_ok", "c1_ratio", "dir_ok", "hour"]
+    cols = ["pair", "tf", "model", "direction", "stop_mode", "alert_time", "entry_time", "rr", "R",
+            "outcome", "mfe", "c1_ratio", "dir_ok", "hour", "bias_struct", "bias_week", "bias_ma"]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
         for t in sorted(trades, key=lambda x: x["entry_time"]):
-            w.writerow([t[c] if c not in ("alert_time", "entry_time") else
-                        pd.Timestamp(t[c]).strftime("%Y-%m-%d %H:%M") for c in cols])
+            w.writerow([pd.Timestamp(t[c]).strftime("%Y-%m-%d %H:%M") if c in ("alert_time", "entry_time")
+                        else t[c] for c in cols])
 
 
-def main(loader=None, dxy=None, dxy_loaded=False):
+def main(loader=None):
     loader = loader or load_oanda
-    bot.CONFIG["dxy_bias"] = "auto"
-    bot.CONFIG["models"] = ALL_MODELS
-    bot.CONFIG["require_sweep_candle_direction"] = False   # tested afterwards as a filter
-    bot.CONFIG["min_body_ratio"] = 0.0                      # tested afterwards as a filter
-    if not dxy_loaded:
-        dxy = load_dxy()
-    trades, used, cache = [], [], {}
-    for pair in bot.CONFIG["pairs"]:
+    bot.CONFIG["models"] = YOUR_MODELS
+    bot.CONFIG["require_sweep_candle_direction"] = False   # applied afterwards as a filter
+    bot.CONFIG["min_body_ratio"] = 0.0                      # applied afterwards as a filter
+    names = list(bot.CONFIG["pairs"]) + (list(EXTRA_PAIRS) if EXTRA else [])
+    trades, signals, used = [], [], []
+    for pair in names:
         try:
             h1 = loader(pair, YEARS)
         except Exception as e:
@@ -312,15 +345,16 @@ def main(loader=None, dxy=None, dxy_loaded=False):
         if h1 is None or len(h1) < 500:
             print(f"{pair}: not enough data")
             continue
-        t = find_trades(pair, h1, dxy, cache)
-        print(f"{pair}: {len(h1)} candles, {len(t)} simulated trades")
+        t, s = find_trades(pair, h1)
+        print(f"{pair}: {len(h1)} candles, {len(s)} MSS signals, {len(t)} simulated trades")
         trades += t
+        signals += s
         used.append(pair)
     if not used:
         print("No data. Is OANDA_TOKEN set?")
         tg("Backtest failed: no data. Check OANDA_TOKEN.")
         return
-    text = report(trades, used, YEARS, dxy is not None)
+    text = report(trades, signals, used, YEARS)
     print(text)
     path = os.path.join(tempfile.gettempdir(), "crt_backtest_trades.csv")
     save_csv(trades, path)

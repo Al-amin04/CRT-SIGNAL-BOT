@@ -55,6 +55,14 @@ CONFIG = {
     # retest of the broken MSS level, with stop at the sweep and target at the
     # opposite CRT level. Set 0 to turn the filter off.
     "min_rr": 2.0,
+    # Higher timeframe bias of each market itself (replaces the DXY rule):
+    # "struct" = daily swing structure (higher highs/lows = bullish, lower = bearish)
+    # "week"   = direction of the last closed weekly candle
+    # "ma"     = last daily close above/below the 50-day average
+    # "none"   = no bias filter
+    "bias_mode": "struct",
+    # stop: "extreme" = deepest sweep point, "protected" = last swing before the break
+    "stop_mode": "extreme",
     "max_between": 5,       # max candles between candle 1 and the sweep candle
     "lookback_sweeps": 2,   # how many recent CRT candles may be the sweep candle
     "swing_n": 2,           # bars each side for a swing high/low
@@ -77,6 +85,11 @@ DELTA = {
     "1D": pd.Timedelta(days=1),
 }
 TF_NAME = {"1D": "Daily", "4H": "4H", "1H": "1H"}
+# Stop buffer beyond the stop level (about 1.5 pips). Price units.
+STOP_BUFFER = {"EURUSD": 0.00015, "GBPUSD": 0.00020, "USDJPY": 0.015, "GBPJPY": 0.030,
+               "AUDUSD": 0.00015, "USDCAD": 0.00020, "NZDUSD": 0.00020,
+               "XAUUSD": 0.50, "XAGUSD": 0.05, "EURJPY": 0.025, "EURGBP": 0.00015,
+               "AUDJPY": 0.030, "NZDJPY": 0.035, "USDCHF": 0.00020, "CADJPY": 0.035}
 
 
 # ------------------------------------------------------------------- DATA
@@ -136,7 +149,7 @@ def fetch_oanda_1h(pair):
     key = {"M": "mid", "B": "bid", "A": "ask"}[price]
     try:
         candles = oanda_get(f"{pair[:3]}_{pair[3:]}",
-                            {"granularity": "H1", "count": 1000, "price": price})
+                            {"granularity": "H1", "count": 3000, "price": price})
     except Exception as e:
         print(f"  OANDA error {pair}: {e}")
         return None
@@ -231,6 +244,84 @@ def weekly_bias(dxy_1h, now):
 
 
 # ---------------------------------------------------------- CRT DETECTION
+def week_key(ts):
+    """Monday that starts the trading week (week opens Sunday 17:00 New York)."""
+    k = ts + pd.Timedelta(hours=7)
+    return (k - pd.Timedelta(days=k.weekday())).normalize()
+
+
+def bias_from_daily(daily, mode, now):
+    """Higher timeframe bias of one market. +1 bullish, -1 bearish, 0 neutral.
+
+    daily must hold CLOSED daily candles only.
+    """
+    if mode == "struct":
+        d = daily.iloc[-120:]
+        n = 2
+        hi, lo = d.high.values, d.low.values
+        highs, lows = [], []
+        for k in range(n, len(d) - n):
+            if hi[k] > hi[k - n : k].max() and hi[k] > hi[k + 1 : k + n + 1].max():
+                highs.append(hi[k])
+            if lo[k] < lo[k - n : k].min() and lo[k] < lo[k + 1 : k + n + 1].min():
+                lows.append(lo[k])
+        if len(highs) < 2 or len(lows) < 2:
+            return 0
+        if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+            return 1
+        if highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+            return -1
+        return 0
+    if mode == "ma":
+        if len(daily) < 50:
+            return 0
+        return 1 if daily.close.iloc[-1] > daily.close.iloc[-50:].mean() else -1
+    if mode == "week":
+        d = daily.iloc[-60:]
+        if d.empty:
+            return 0
+        keys = [week_key(t) for t in d.index]
+        weekly = d.groupby(keys).agg(AGG)
+        closed = weekly[weekly.index < week_key(now)]
+        if closed.empty:
+            return 0
+        w = closed.iloc[-1]
+        return 1 if w.close > w.open else -1
+    return 0
+
+
+def mss_stop(ltf, direction, mss, mode, buffer=0.0):
+    """Stop price. 'extreme' = deepest sweep point. 'protected' = last swing
+    low (high) before the break, if there is one. A small buffer goes beyond it."""
+    sg = 1 if direction == "buy" else -1
+    stop = mss["extreme"]
+    if mode == "protected":
+        n = CONFIG["swing_n"]
+        lo = ltf.low.values if sg == 1 else -ltf.high.values
+        p, q = mss["p"], mss["q"]
+        for k in range(q - 1, p, -1):
+            if k - n < 0 or k + n > q:
+                continue
+            if lo[k] < lo[k - n : k].min() and lo[k] < lo[k + 1 : k + n + 1].min():
+                stop = lo[k] * sg
+                break
+    return float(stop - sg * buffer)
+
+
+def pair_bias(df, now):
+    """(+1/-1/0 or None, text). None = no bias filter."""
+    mode = CONFIG["bias_mode"]
+    if mode == "none":
+        return None, ""
+    daily = drop_forming(resample(df, "1D"), "1D", now)
+    b = bias_from_daily(daily, mode, now)
+    return b, {1: "bullish", -1: "bearish", 0: "neutral"}[b]
+
+
+def directions_for(b):
+    return {None: {"buy", "sell"}, 1: {"buy"}, -1: {"sell"}, 0: set()}[b]
+
+
 def find_setup(c, i):
     """Candle i is the sweep candle. Look back for candle 1 (the CRT range).
 
@@ -326,6 +417,8 @@ def find_mss(ltf, direction, H, L, start):
                 "time": ltf.index[q],
                 "level": float(ref * sg),
                 "extreme": float(lo[p] * sg),
+                "p": p,
+                "q": q,
             }
     return None
 
@@ -352,7 +445,7 @@ def calc_rr(direction, entry, stop, target):
 
 def setup_prices(setup, mss):
     buy = setup["direction"] == "buy"
-    return mss["extreme"], (setup["H"] if buy else setup["L"])
+    return mss.get("stop", mss["extreme"]), (setup["H"] if buy else setup["L"])
 
 
 def to_local(ts):
@@ -383,19 +476,18 @@ def build_message(pair, tf, ltf_tf, setup, mss, price, bias, source="", closes_a
     if mss:
         stop, target = setup_prices(setup, mss)
         word = "above" if buy else "below"
-        lines.append(f"Sweep {'low' if buy else 'high'}: {fmt(pair, stop)}")
+        lines.append(f"Sweep {'low' if buy else 'high'}: {fmt(pair, mss['extreme'])}")
         lines.append(f"MSS on {ltf_tf}: closed {word} {fmt(pair, mss['level'])} (candle {local_time(mss['time'])})")
-        lines.append(f"Stop: beyond {fmt(pair, stop)}")
+        lines.append(f"LIMIT entry (retest of MSS level): {fmt(pair, mss['level'])}")
+        lines.append(f"Stop: {fmt(pair, stop)}")
         lines.append(f"Target: {fmt(pair, target)} (CRT {'H' if buy else 'L'})")
-        rr_lvl = calc_rr(setup["direction"], mss["level"], stop, target)
-        rr_now = calc_rr(setup["direction"], price, stop, target)
-        lines.append(f"Price now: {fmt(pair, price)}")
-        lines.append(f"RR from MSS level: {rr_lvl:.1f}   RR at price now: {rr_now:.1f}")
-        lines.append("Next: find your POI on the chart.")
+        rr = calc_rr(setup["direction"], mss["level"], stop, target)
+        lines.append(f"RR from entry: {rr:.1f}   Price now: {fmt(pair, price)}")
+        lines.append("Cancel the order if price reaches the target before the retest.")
     else:
         lines.append(f"CRT confirmed: swept, then closed back inside the range. Waiting for the MSS on {ltf_tf}.")
-    if usd_role(pair):
-        lines.append(f"DXY weekly bias: {bias}")
+    if bias:
+        lines.append(f"HTF bias ({CONFIG['bias_mode']}): {bias}")
     lines.append("Times are Lagos time (UTC+1)")
     if source:
         lines.append(f"Data: {source}")
@@ -463,9 +555,10 @@ def make_chart(pair, tf, ltf_tf, crt, ltf, setup, mss, forming, path):
         ax2.text(len(bot) + 0.5, swept, f" {swept_name}", fontsize=8, va="center")
         if mss:
             ax2.axhline(mss["level"], color="#ef6c00", ls=":", lw=1.2)
-            ax2.text(0, mss["level"], " MSS level", color="#ef6c00", fontsize=8, va="bottom")
-            ax2.axhline(mss["extreme"], color="black", ls=":", lw=1)
-            ax2.text(0, mss["extreme"], " sweep extreme / stop", fontsize=8, va="top")
+            ax2.text(0, mss["level"], " MSS level = limit entry", color="#ef6c00", fontsize=8, va="bottom")
+            stop_px = mss.get("stop", mss["extreme"])
+            ax2.axhline(stop_px, color="black", ls=":", lw=1)
+            ax2.text(0, stop_px, " stop", fontsize=8, va="top")
             if mss["time"] in bot.index:
                 mx = bot.index.get_loc(mss["time"])
                 ax2.annotate("MSS", xy=(mx, bot.close.iloc[mx]), xytext=(mx, mss["level"]),
@@ -544,21 +637,17 @@ def alert(pair, tf, ltf_tf, crt, ltf, setup, mss, price, bias, source, now):
 def run():
     now = pd.Timestamp.now(tz=CONFIG["tz"]).tz_localize(None)
     state = load_state()
-    bias = None
-    if any(usd_role(p) for p in CONFIG["pairs"]):
-        dxy = fetch_1h(CONFIG["dxy"])
-        if dxy is not None:
-            bias = weekly_bias(dxy, now)
-        print(f"DXY weekly bias: {bias}")
 
     for pair, tickers in CONFIG["pairs"].items():
         df, source = fetch_pair(pair, tickers)
         if df is None:
             print(f"{pair}: no data")
             continue
-        dirs = allowed_directions(pair, bias)
+        b, bias_txt = pair_bias(df, now)
+        dirs = directions_for(b)
+        print(f"{pair}: HTF bias {bias_txt or 'off'}")
         if not dirs:
-            print(f"{pair}: skipped, no DXY bias")
+            print(f"{pair}: skipped, neutral bias")
             continue
         price = float(df.close.iloc[-1])
         for tf, ltf_tf in CONFIG["crt_timeframes"].items():
@@ -574,15 +663,17 @@ def run():
                     ltf, setup["direction"], setup["H"], setup["L"], setup["sweep_time"]
                 )
                 if mss:
+                    mss["stop"] = mss_stop(ltf, setup["direction"], mss, CONFIG["stop_mode"],
+                                           STOP_BUFFER.get(pair, 0.0))
                     stop, target = setup_prices(setup, mss)
                     rr = calc_rr(setup["direction"], mss["level"], stop, target)
                     if rr < CONFIG["min_rr"]:
                         print(f"  {pair} {tf}: skipped, RR {rr:.1f} below {CONFIG['min_rr']}")
                     elif key not in state["sent"]:
-                        if alert(pair, tf, ltf_tf, crt, ltf, setup, mss, price, bias, source, now):
+                        if alert(pair, tf, ltf_tf, crt, ltf, setup, mss, price, bias_txt, source, now):
                             state["sent"][key] = now.isoformat()
                 elif CONFIG["alert_on_sweep"] and key + "|sweep" not in state["sent"]:
-                    if alert(pair, tf, ltf_tf, crt, ltf, setup, None, price, bias, source, now):
+                    if alert(pair, tf, ltf_tf, crt, ltf, setup, None, price, bias_txt, source, now):
                         state["sent"][key + "|sweep"] = now.isoformat()
             print(f"{pair} {tf}: checked")
     save_state(state, now)
