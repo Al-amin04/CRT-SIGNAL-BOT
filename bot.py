@@ -33,6 +33,12 @@ CONFIG = {
         "AUDUSD": ["AUDUSD=X"],
         "USDCAD": ["USDCAD=X"],
         "NZDUSD": ["NZDUSD=X"],
+        "EURJPY": ["EURJPY=X"],
+        "EURGBP": ["EURGBP=X"],
+        "AUDJPY": ["AUDJPY=X"],
+        "NZDJPY": ["NZDJPY=X"],
+        "USDCHF": ["USDCHF=X"],
+        "CADJPY": ["CADJPY=X"],
     },
     "dxy": ["DX-Y.NYB"],
     # "auto" = bot decides from last closed weekly DXY candles.
@@ -61,12 +67,15 @@ CONFIG = {
     # "ma"     = last daily close above/below the 50-day average
     # "none"   = no bias filter
     "bias_mode": "struct",
+    # False = scanner mode: the bias is shown on every alert (agrees / against) but does not block it.
+    # True  = alerts only fire in the direction of the bias.
+    "bias_filter": False,
     # stop: "extreme" = deepest sweep point, "protected" = last swing before the break
     "stop_mode": "extreme",
     "max_between": 5,       # max candles between candle 1 and the sweep candle
     "lookback_sweeps": 2,   # how many recent CRT candles may be the sweep candle
     "swing_n": 2,           # bars each side for a swing high/low
-    "alert_on_sweep": True,   # also alert on a sweep before the MSS shows
+    "alert_on_sweep": False,  # also alert on a sweep before the MSS shows
     "tz": "America/New_York",  # daily candle closes 17:00 in this zone
     "display_tz": "Africa/Lagos",  # time zone shown in alerts
     # "oanda" = OANDA prices (matches TradingView OANDA charts). Needs OANDA_TOKEN.
@@ -328,6 +337,16 @@ def pair_bias(df, now):
     return b, {1: "bullish", -1: "bearish", 0: "neutral"}[b]
 
 
+def bias_note(b, text, direction):
+    """Bias text for one alert: says whether it agrees with the trade direction."""
+    if b is None:
+        return ""
+    if b == 0:
+        return "neutral (no clear daily structure)"
+    agrees = (b == 1) == (direction == "buy")
+    return f"{text}, {'AGREES with' if agrees else 'AGAINST'} this {direction}"
+
+
 def directions_for(b):
     return {None: {"buy", "sell"}, 1: {"buy"}, -1: {"sell"}, 0: set()}[b]
 
@@ -481,6 +500,10 @@ def build_message(pair, tf, ltf_tf, setup, mss, price, bias, source="", closes_a
         last = k == len(setup["times"]) - 1
         name = "Candle %d (sweep)" % (k + 1) if last else names.get(k, "Candle %d" % (k + 1))
         lines.append(f"{name}: {local_time(t)}")
+    if tf == "4H":
+        hr = pd.Timestamp(setup["sweep_time"]).hour
+        lines.append(f"Sweep candle opened {hr:02d}:00 New York time "
+                     f"({'INSIDE' if hr in (1, 5, 9) else 'outside'} the book's 1/5/9am window)")
     if closes_at is not None:
         lines.append(f"Sweep candle closes {local_time(closes_at)}. Valid only if it closes back inside CRT H/L.")
     if mss:
@@ -658,7 +681,7 @@ def run():
             continue
         df15 = fetch_pair(pair, tickers, "M15")[0] if need15 else None
         b, bias_txt = pair_bias(df, now)
-        dirs = directions_for(b)
+        dirs = directions_for(b) if CONFIG["bias_filter"] else {"buy", "sell"}
         print(f"{pair}: HTF bias {bias_txt or 'off'}")
         if not dirs:
             print(f"{pair}: skipped, neutral bias")
@@ -677,6 +700,7 @@ def run():
                 if not setup or setup["direction"] not in dirs:
                     continue
                 key = f"{pair}|{tf}|{setup['c1_time']}|{setup['direction']}"
+                btxt = bias_note(b, bias_txt, setup["direction"])
                 mss = find_mss(
                     ltf, setup["direction"], setup["H"], setup["L"], setup["sweep_time"]
                 )
@@ -688,10 +712,10 @@ def run():
                     if rr < CONFIG["min_rr"]:
                         print(f"  {pair} {tf}: skipped, RR {rr:.1f} below {CONFIG['min_rr']}")
                     elif key not in state["sent"]:
-                        if alert(pair, tf, ltf_tf, crt, ltf, setup, mss, price, bias_txt, source, now):
+                        if alert(pair, tf, ltf_tf, crt, ltf, setup, mss, price, btxt, source, now):
                             state["sent"][key] = now.isoformat()
                 elif CONFIG["alert_on_sweep"] and key + "|sweep" not in state["sent"]:
-                    if alert(pair, tf, ltf_tf, crt, ltf, setup, None, price, bias_txt, source, now):
+                    if alert(pair, tf, ltf_tf, crt, ltf, setup, None, price, btxt, source, now):
                         state["sent"][key + "|sweep"] = now.isoformat()
             print(f"{pair} {tf}: checked")
     save_state(state, now)
