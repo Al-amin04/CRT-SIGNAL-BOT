@@ -39,7 +39,7 @@ CONFIG = {
     # "buy" or "sell" = you set the DXY weekly bias by hand.
     "dxy_bias": "auto",
     # CRT timeframe -> lower timeframe used for the MSS
-    "crt_timeframes": {"1D": "4H", "4H": "1H"},
+    "crt_timeframes": {"1D": "1H", "4H": "15M"},
     # "inside" = sweep candle must close back inside the CRT range
     # "wick"   = a wick beyond the level is enough
     "sweep_confirm": "inside",
@@ -80,11 +80,12 @@ CONFIG = {
 STATE_FILE = "state.json"
 AGG = {"open": "first", "high": "max", "low": "min", "close": "last"}
 DELTA = {
+    "15M": pd.Timedelta(minutes=15),
     "1H": pd.Timedelta(hours=1),
     "4H": pd.Timedelta(hours=4),
     "1D": pd.Timedelta(days=1),
 }
-TF_NAME = {"1D": "Daily", "4H": "4H", "1H": "1H"}
+TF_NAME = {"1D": "Daily", "4H": "4H", "1H": "1H", "15M": "15M"}
 # Stop buffer beyond the stop level (about 1.5 pips). Price units.
 STOP_BUFFER = {"EURUSD": 0.00015, "GBPUSD": 0.00020, "USDJPY": 0.015, "GBPJPY": 0.030,
                "AUDUSD": 0.00015, "USDCAD": 0.00020, "NZDUSD": 0.00020,
@@ -93,8 +94,8 @@ STOP_BUFFER = {"EURUSD": 0.00015, "GBPUSD": 0.00020, "USDJPY": 0.015, "GBPJPY": 
 
 
 # ------------------------------------------------------------------- DATA
-def fetch_1h(tickers):
-    """Download 1H candles. Index = New York wall-clock time, no timezone."""
+def fetch_1h(tickers, interval="1h"):
+    """Download candles from Yahoo ("1h" or "15m"). Index = New York clock, no timezone."""
     import yfinance as yf
 
     for t in tickers:
@@ -102,7 +103,7 @@ def fetch_1h(tickers):
             df = yf.download(
                 t,
                 period=CONFIG["history"],
-                interval="1h",
+                interval=interval,
                 progress=False,
                 auto_adjust=False,
             )
@@ -141,17 +142,17 @@ def oanda_get(inst, params):
     raise RuntimeError(last)
 
 
-def fetch_oanda_1h(pair):
-    """OANDA 1H candles. Same index format as fetch_1h."""
+def fetch_oanda(pair, gran="H1"):
+    """OANDA candles (gran H1 or M15). Same index format as fetch_1h."""
     if not os.environ.get("OANDA_TOKEN"):
         return None
     price = CONFIG["oanda_price"]
     key = {"M": "mid", "B": "bid", "A": "ask"}[price]
     try:
         candles = oanda_get(f"{pair[:3]}_{pair[3:]}",
-                            {"granularity": "H1", "count": 3000, "price": price})
+                            {"granularity": gran, "count": 3000, "price": price})
     except Exception as e:
-        print(f"  OANDA error {pair}: {e}")
+        print(f"  OANDA error {pair} {gran}: {e}")
         return None
     rows = [
         (c["time"], float(c[key]["o"]), float(c[key]["h"]),
@@ -168,21 +169,30 @@ def fetch_oanda_1h(pair):
     return df[~df.index.duplicated(keep="last")].sort_index()
 
 
-def fetch_pair(pair, tickers):
-    """Returns (dataframe, source name)."""
+def fetch_oanda_1h(pair):
+    return fetch_oanda(pair, "H1")
+
+
+def fetch_pair(pair, tickers, gran="H1"):
+    """Returns (dataframe, source name). gran is H1 or M15."""
     if CONFIG["source"] == "oanda":
-        df = fetch_oanda_1h(pair)
+        df = fetch_oanda(pair, gran)
         if df is not None:
             return df, "OANDA"
-        print(f"  {pair}: OANDA failed or no token, using Yahoo")
-    df = fetch_1h(tickers)
+        print(f"  {pair}: OANDA {gran} failed or no token, using Yahoo")
+    df = fetch_1h(tickers, "1h" if gran == "H1" else "15m")
     return df, "Yahoo (levels may differ from TradingView)"
 
 
 def resample(df, tf):
-    """Build 4H or daily candles aligned to the 17:00 New York close."""
-    if tf == "1H":
+    """Build 1H, 4H or daily candles from finer data, aligned to the 17:00 New York close."""
+    if tf == "15M":
         return df
+    if tf == "1H":
+        step = df.index.to_series().diff().median()
+        if pd.isna(step) or step >= pd.Timedelta(hours=1):
+            return df
+        return df.resample("1h").agg(AGG).dropna()
     if tf == "4H":
         r = df.resample("4h", offset="1h")  # 01,05,09,13,17,21
     else:
@@ -548,6 +558,8 @@ def make_chart(pair, tf, ltf_tf, crt, ltf, setup, mss, forming, path):
     # bottom: lower timeframe, sweep and MSS
     start = int(ltf.index.searchsorted(setup["sweep_time"]))
     bot = ltf.iloc[max(start - 12, 0):]
+    if len(bot) > 110:
+        bot = bot.iloc[-110:]
     if len(bot):
         draw_candles(ax2, bot)
         swept, swept_name = (L, "CRT L") if buy else (H, "CRT H")
@@ -637,22 +649,28 @@ def alert(pair, tf, ltf_tf, crt, ltf, setup, mss, price, bias, source, now):
 def run():
     now = pd.Timestamp.now(tz=CONFIG["tz"]).tz_localize(None)
     state = load_state()
+    need15 = "15M" in CONFIG["crt_timeframes"].values()
 
     for pair, tickers in CONFIG["pairs"].items():
-        df, source = fetch_pair(pair, tickers)
+        df, source = fetch_pair(pair, tickers, "H1")
         if df is None:
             print(f"{pair}: no data")
             continue
+        df15 = fetch_pair(pair, tickers, "M15")[0] if need15 else None
         b, bias_txt = pair_bias(df, now)
         dirs = directions_for(b)
         print(f"{pair}: HTF bias {bias_txt or 'off'}")
         if not dirs:
             print(f"{pair}: skipped, neutral bias")
             continue
-        price = float(df.close.iloc[-1])
+        price = float((df15 if df15 is not None else df).close.iloc[-1])
         for tf, ltf_tf in CONFIG["crt_timeframes"].items():
+            base = df15 if ltf_tf == "15M" else df
+            if base is None:
+                print(f"{pair} {tf}: no {ltf_tf} data")
+                continue
             crt = drop_forming(resample(df, tf), tf, now)  # closed candles only
-            ltf = drop_forming(resample(df, ltf_tf), ltf_tf, now)
+            ltf = drop_forming(resample(base, ltf_tf), ltf_tf, now)
             n = len(crt)
             for i in range(n - 1, max(n - 1 - CONFIG["lookback_sweeps"], 0), -1):
                 setup = find_setup(crt, i)

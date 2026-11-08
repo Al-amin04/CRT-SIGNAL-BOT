@@ -1,4 +1,4 @@
-"""Backtest v4 of the CRT bot rules on past OANDA data. Sends the summary to Telegram.
+"""Backtest v5 of the CRT bot rules on past OANDA data. Sends the summary to Telegram.
 
 Uses the same detection code as bot.py (CRT range, model, sweep, MSS).
 It walks forward candle by candle, so it never uses future data to find a setup.
@@ -10,7 +10,8 @@ Rules tested (your plan):
 - Stop: beyond the sweep extreme, or beyond the last swing before the break ("protected").
 - Target: the opposite CRT level. Minimum RR 1:2 (counted from the entry).
 - If stop and target fall in the same 1H candle, the stop counts first.
-- Spreads are assumed. Real results will differ.
+- Execution: daily CRT uses the 1H for the MSS, 4H CRT uses the 15M. All fills are walked on 15M candles.
+- Spread cost uses OANDA's RECORDED spread at the moment of the fill, not a guess.
 - Tuning period and a hold-out period (last 18 months) are reported separately.
 
 Run:  python backtest.py            (needs OANDA_TOKEN; BACKTEST_YEARS optional)
@@ -28,8 +29,8 @@ import bot
 
 YEARS = float(os.environ.get("BACKTEST_YEARS") or 5)
 EXTRA = (os.environ.get("BACKTEST_EXTRA") or "no").lower() == "yes"
-ENTRY_WAIT_BARS = 24      # hours to wait for the retest
-MAX_HOLD_BARS = 240       # hours before a trade is closed at market
+ENTRY_WAIT_BARS = 24 * 4  # 15-minute bars: wait 24 hours for the retest
+MAX_HOLD_BARS = 240 * 4   # 15-minute bars: close at market after 10 days
 MIN_BODY = 0.5            # candle 1 body share (book rule)
 HOLDOUT_DAYS = 548        # last ~18 months are kept apart
 MIN_TRADES = 30           # a rule set needs this many tuning trades to be chosen
@@ -38,43 +39,42 @@ STOPS = ("extreme", "protected")
 YOUR_MODELS = ["3 candle", "Inside bar"]
 EXTRA_PAIRS = {"EURJPY": ["EURJPY=X"], "EURGBP": ["EURGBP=X"], "AUDJPY": ["AUDJPY=X"],
                "NZDJPY": ["NZDJPY=X"], "USDCHF": ["USDCHF=X"], "CADJPY": ["CADJPY=X"]}
-# Assumed typical spreads in price units. These are guesses, not your broker's numbers.
-SPREADS = {"EURUSD": 0.00010, "GBPUSD": 0.00015, "USDJPY": 0.012, "GBPJPY": 0.025,
-           "AUDUSD": 0.00012, "USDCAD": 0.00015, "NZDUSD": 0.00018,
-           "XAUUSD": 0.35, "XAGUSD": 0.04, "EURJPY": 0.020, "EURGBP": 0.00015,
-           "AUDJPY": 0.025, "NZDJPY": 0.030, "USDCHF": 0.00015, "CADJPY": 0.030}
+
 
 
 # ------------------------------------------------------------------- DATA
 def load_oanda(pair, years):
-    """Page back through OANDA 1H candles. Same index format as bot.fetch_1h."""
+    """Page back through OANDA 15-minute candles (bid prices) with the recorded spread.
+
+    Same index format as the bot: New York clock, no timezone. Column 'spread' = ask close - bid close.
+    """
     tok = os.environ.get("OANDA_TOKEN")
     if not tok:
         return None
-    key = {"M": "mid", "B": "bid", "A": "ask"}[bot.CONFIG["oanda_price"]]
     inst = f"{pair[:3]}_{pair[3:]}"
     start = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=int(365 * years))
     rows = []
     while True:
         cs = bot.oanda_get(inst, {
-            "granularity": "H1",
+            "granularity": "M15",
             "count": 5000,
-            "price": bot.CONFIG["oanda_price"],
+            "price": "BA",
             "from": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
         })
         if not cs:
             break
         for c in cs:
-            if c.get("complete") and key in c:
-                m = c[key]
-                rows.append((c["time"], float(m["o"]), float(m["h"]), float(m["l"]), float(m["c"])))
+            if c.get("complete") and "bid" in c and "ask" in c:
+                b_, a_ = c["bid"], c["ask"]
+                rows.append((c["time"], float(b_["o"]), float(b_["h"]), float(b_["l"]), float(b_["c"]),
+                             max(float(a_["c"]) - float(b_["c"]), 0.0)))
         last = pd.to_datetime(cs[-1]["time"], utc=True)
-        if len(cs) < 5000 or last >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=2):
+        if len(cs) < 5000 or last >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=1):
             break
-        start = last + pd.Timedelta(hours=1)
+        start = last + pd.Timedelta(minutes=15)
     if not rows:
         return None
-    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close"])
+    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "spread"])
     df["time"] = pd.to_datetime(df["time"], utc=True)
     df = df.set_index("time")
     df.index = df.index.tz_convert(bot.CONFIG["tz"]).tz_localize(None)
@@ -91,6 +91,7 @@ def simulate(h1, direction, level, stop, target, t0):
     hi = h1.high.values if sg == 1 else -h1.low.values
     lo = h1.low.values if sg == 1 else -h1.high.values
     cl = h1.close.values * sg
+    spr = h1["spread"].values if "spread" in h1.columns else np.zeros(len(h1))
     lev, stp, tgt = level * sg, stop * sg, target * sg
     if not (stp < lev < tgt):
         return {"skip": "geometry"}
@@ -105,7 +106,8 @@ def simulate(h1, direction, level, stop, target, t0):
                 return {"skip": "ran"}  # ran to target with no retest
             continue
         if lo[k] <= stp:                # touched, then stopped, same candle
-            return {"R": -1.0, "outcome": "loss", "entry_time": h1.index[k], "rr": rr, "mfe": 0.0}
+            return {"R": -1.0, "outcome": "loss", "entry_time": h1.index[k], "rr": rr, "mfe": 0.0,
+                    "spread": float(spr[k])}
         if hi[k] >= tgt:
             return {"skip": "amb"}      # order of events unknown
         fill = k
@@ -127,23 +129,22 @@ def simulate(h1, direction, level, stop, target, t0):
             return {"skip": "short"}
         result = ("timeout", (cl[last - 1] - lev) / risk)
     return {"R": result[1], "outcome": result[0], "entry_time": h1.index[fill],
-            "rr": rr, "mfe": mfe}
+            "rr": rr, "mfe": mfe, "spread": float(spr[fill])}
 
 
-def find_trades(pair, h1):
-    """All setups with an MSS, simulated for both stop styles.
+def find_trades(pair, m15):
+    """All setups with an MSS, simulated for both stop styles on 15M candles.
 
     Returns (trades, signals). Signals record whether each MSS got a retest fill.
     """
     trades, signals = [], []
-    now = h1.index[-1] + pd.Timedelta(hours=1)
-    daily = bot.drop_forming(bot.resample(h1, "1D"), "1D", now)
+    now = m15.index[-1] + pd.Timedelta(minutes=15)
+    daily = bot.drop_forming(bot.resample(m15, "1D"), "1D", now)
     daily_end = daily.index + pd.Timedelta(days=1)
     buf = bot.STOP_BUFFER.get(pair, 0.0)
-    spread = SPREADS.get(pair, 0.0)
     for tf, ltf_tf in bot.CONFIG["crt_timeframes"].items():
-        crt = bot.drop_forming(bot.resample(h1, tf), tf, now)
-        ltf = bot.drop_forming(bot.resample(h1, ltf_tf), ltf_tf, now)
+        crt = bot.drop_forming(bot.resample(m15, tf), tf, now)
+        ltf = bot.drop_forming(bot.resample(m15, ltf_tf), ltf_tf, now)
         dlt, ldt = bot.DELTA[tf], bot.DELTA[ltf_tf]
         for i in range(8, len(crt)):
             setup = bot.find_setup(crt, i)
@@ -167,20 +168,25 @@ def find_trades(pair, h1):
             # higher timeframe bias known at the sweep candle's open
             d_slice = daily.iloc[: int(np.searchsorted(daily_end.values, np.datetime64(s0), side="right"))]
             bias = {md: bot.bias_from_daily(d_slice, md, s0) for md in ("struct", "week", "ma")}
-            target = setup["H"] if setup["direction"] == "buy" else setup["L"]
+            buy = setup["direction"] == "buy"
+            target = setup["H"] if buy else setup["L"]
+            rng = setup["H"] - setup["L"]
+            # where the MSS level sits in the CRT range: 0 = swept side, 1 = at the target
+            entry_pos = ((mss["level"] - setup["L"]) / rng) if buy else ((setup["H"] - mss["level"]) / rng)
             base = dict(pair=pair, tf=tf, model=setup["model"], direction=setup["direction"],
                         alert_time=alert_t, c1_ratio=setup["c1_ratio"], dir_ok=setup["dir_ok"],
                         hour=s0.hour, bias_struct=bias["struct"], bias_week=bias["week"],
-                        bias_ma=bias["ma"])
+                        bias_ma=bias["ma"], entry_pos=float(entry_pos))
             for sm in STOPS:
                 stop = bot.mss_stop(window, setup["direction"], mss, sm, buf)
-                res = simulate(h1, setup["direction"], mss["level"], stop, target, alert_t)
+                res = simulate(m15, setup["direction"], mss["level"], stop, target, alert_t)
                 if sm == "extreme":
                     signals.append(dict(base, reason=res.get("skip", "filled")))
                 if "skip" in res:
                     continue
-                res["R"] -= spread / abs(mss["level"] - stop)     # entry cost in R
-                trades.append(dict(res, **base, stop_mode=sm))
+                cost = res["spread"] / abs(mss["level"] - stop)       # recorded spread at the fill, in R
+                res["R"] -= cost
+                trades.append(dict(res, **base, stop_mode=sm, cost_r=cost))
     return trades, signals
 
 
@@ -245,10 +251,11 @@ def mfe_line(trades):
 def report(trades, signals, pairs, years):
     split = max(t["alert_time"] for t in trades + signals) - pd.Timedelta(days=HOLDOUT_DAYS) if (trades or signals) else None
     RR = 2.0
-    L = [f"CRT BACKTEST v4 | {years:g}y OANDA {bot.CONFIG['oanda_price']} | pairs: {len(pairs)}",
+    L = [f"CRT BACKTEST v5 | {years:g}y OANDA {bot.CONFIG['oanda_price']} | pairs: {len(pairs)}",
          "Models: 3 candle + inside bar. Book rules on (candle 2 direction, candle 1 body >= 50%).",
-         "Entry = limit on retest of the MSS level (24h wait). Target = opposite CRT level.",
-         f"Min RR {RR:g} counted from the entry. Stop has a ~1.5 pip buffer. R is net of ASSUMED spreads.",
+         "Daily CRT: MSS on the 1H. 4H CRT: MSS on the 15M. Entry = limit on retest of the MSS level.",
+         "Target = opposite CRT level. Fills walked on 15M candles.",
+         f"Min RR {RR:g} counted from the entry. Stop has a ~1.5 pip buffer. R is net of OANDA's recorded spreads.",
          f"TUNING = before {split:%Y-%m-%d}. HOLD-OUT = after (about 18 months). Choose from tuning only.", ""]
 
     sig_t = pick(signals, until=split)
@@ -259,6 +266,12 @@ def report(trades, signals, pairs, years):
                  f"ran to target with no retest {100 * c['ran'] / n:.0f}%, never retested {100 * c['nofill'] / n:.0f}%, "
                  f"MSS level already past the target {100 * c['geometry'] / n:.0f}%, "
                  f"unclear {100 * (c['amb'] + c['short']) / n:.0f}%")
+    if n:
+        ep = np.array([t["entry_pos"] for t in sig_t])
+        bins = [(-9, 0, "below the swept side"), (0, .25, "0-25%"), (.25, .5, "25-50%"),
+                (.5, .75, "50-75%"), (.75, 1, "75-100%"), (1, 9, "at or past the target")]
+        parts = [f"{lab} {100 * ((ep >= lo_) & (ep < hi_)).mean():.0f}%" for lo_, hi_, lab in bins]
+        L += ["", "WHERE THE MSS LEVEL SITS IN THE CRT RANGE (0% = swept side, 100% = target):", "  " + " | ".join(parts)]
     L += ["", f"TUNING PERIOD, RR >= {RR:g}: bias x stop"]
     rows = {}
     for b in BIASES:
@@ -282,7 +295,9 @@ def report(trades, signals, pairs, years):
         allsel = pick(trades, b, sm, RR)
         if allsel:
             rrs = np.mean([t["rr"] for t in allsel])
-            L += ["", f"BREAK-EVEN: planned RR averages {rrs:.1f}, so the win rate must beat {100 / (1 + rrs):.0f}% before costs."]
+            cost = np.mean([t["cost_r"] for t in allsel])
+            L += ["", f"BREAK-EVEN: planned RR averages {rrs:.1f}, so the win rate must beat {100 / (1 + rrs):.0f}% before costs.",
+                  f"Recorded spread cost averages {cost:.2f}R per trade (already deducted above)."]
         L += ["", "HOW FAR TRADES RUN before the stop (chosen rule, all data):", "  " + mfe_line(allsel),
               "", "CHOSEN RULE BY MODEL (all data):"]
         for m in YOUR_MODELS:
@@ -342,7 +357,7 @@ def main(loader=None):
         except Exception as e:
             print(f"{pair}: data error {e}")
             continue
-        if h1 is None or len(h1) < 500:
+        if h1 is None or len(h1) < 2000:
             print(f"{pair}: not enough data")
             continue
         t, s = find_trades(pair, h1)
