@@ -75,7 +75,7 @@ CONFIG = {
     "max_between": 5,       # max candles between candle 1 and the sweep candle
     "lookback_sweeps": 2,   # how many recent CRT candles may be the sweep candle
     "swing_n": 2,           # bars each side for a swing high/low
-    "alert_on_sweep": False,  # also alert on a sweep before the MSS shows
+    "alert_on_sweep": True,  # also alert on a sweep before the MSS shows
     "tz": "America/New_York",  # daily candle closes 17:00 in this zone
     "display_tz": "Africa/Lagos",  # time zone shown in alerts
     # "oanda" = OANDA prices (matches TradingView OANDA charts). Needs OANDA_TOKEN.
